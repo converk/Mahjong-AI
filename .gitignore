@@ -10,3 +10,6 @@ tests/
 venv/
 .venv/
 env/
+
+# IDE
+.vscode/
