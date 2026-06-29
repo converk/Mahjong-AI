@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Tests
+tests/
+
 # Virtual environment
 venv/
 .venv/
