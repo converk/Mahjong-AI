@@ -2,7 +2,7 @@
 
 ## 1. 文档作用
 
-本文档定义基于 [KyokuTokenProtocol.md](<D:/env/VSCode Projects/MahjongCopilot/MyCopilot/KyokuTokenProtocol.md:1>) 的动作空间设计。
+本文档定义模型输出侧的离散动作空间设计。动作空间独立于编码器输入协议；即使编码器输入迁移到 `KyokuEventTuple V2` 九维协议，本文档中的 `action_id` 枚举、分段和 450 维输出头仍保持稳定。
 
 它回答三个问题：
 
@@ -10,11 +10,11 @@
 |---|---|
 | 模型输出什么 | Transformer 输出的离散 `action_id` 表示什么语义动作 |
 | 如何从离散 id 还原动作 | 如何把 `action_id` 解码成一个结构化动作 |
-| 如何把动作表达为七维协议 | 如何把一个具体动作转换成一个 `KyokuToken` 七维元组 |
+| 如何把动作交给环境执行 | 如何把一个具体动作转换成环境侧 `ActionInstance` / MJAI response |
 
-这里的动作空间不以 MJAI 协议为中心，而是以 `KyokuToken V1` 为中心。也就是说，模型输出的每个动作都必须最终能够落成一个七维事件 token。
+这里的动作空间以模型输出的 `action_id` 为中心。模型输出不会直接写入输入协议事件历史，而是先解码成环境侧 `ActionInstance`。环境负责把该动作转换为 MJAI response 或内部执行命令，并等待服务器确认后的真实事件进入 `KyokuEventTuple V2` 输入序列。
 
-`KyokuTokenProtocol` 当前已经为 `TYPE` 维度额外预留了 10 个扩展枚举，但 `KyokuActionSpace V1` 目前不会把任何动作解码到这些预留类型上。当前动作空间只会落到已经正式定义的 `EVENT_*` 类型，预留 `TYPE` 仅服务后续协议扩展。
+因此，动作空间不会占用 `KyokuEventTuple V2` 的 `TYPE` 枚举，也不会生成模型输入事件 token。`TYPE` 预留位只服务输入协议自身的后续扩展。
 
 ## 2. 设计原则
 
@@ -24,7 +24,7 @@
 离散 action_id
 -> ActionTemplate（模板动作）
 -> ActionInstance（结合当前局面补全后的具体动作）
--> 一个事件 KyokuToken
+-> 环境侧执行命令 / MJAI response
 ```
 
 三个核心原则：
@@ -32,7 +32,7 @@
 | 原则 | 说明 |
 |---|---|
 | 动作表稳定 | 每个 `action_id` 永远表示同一个模板动作，不随当前候选按钮顺序变化 |
-| 协议同构 | 每个具体动作都必须能转换为一个事件 `KyokuToken` |
+| 环境可执行 | 每个具体动作都必须能转换为环境可执行的 `ActionInstance` 或 MJAI response |
 | 上下文补全 | 一部分字段不直接编码进 `action_id`，而是在当前决策窗口中补全 |
 
 这里的职责划分是：
@@ -50,7 +50,7 @@
 action_id = 0
 -> PASS
 -> PASS on SHIMOCHA discard 3p
--> (EVENT_PASS, SELF, 3p, SHIMOCHA, VALUE_NONE, NONE, TURN_6)
+-> MJAI none / 环境侧 pass command
 ```
 
 ## 3. ActionTemplate 与 ActionInstance
@@ -130,7 +130,7 @@ ActionInstance {
 
 ### 5.1 动作空间用的 37 张可见牌
 
-动作空间使用 `KyokuTokenProtocol` 中 `TILE` 的可见牌集合，按以下固定顺序展开：
+动作空间使用输入协议中 `TILE` 的可见牌集合，按以下固定顺序展开：
 
 ```text
 1m 2m 3m 4m 5m 6m 7m 8m 9m
@@ -212,7 +212,7 @@ model_action_dim = 450
 | 范围 | 含义 |
 |---|---|
 | `0..381` | 当前 V1 已定义并可解码的动作模板 |
-| `382..449` | 预留输出槽位，当前不参与协议解码 |
+| `382..449` | 预留输出槽位，当前不参与动作解码 |
 
 明细如下：
 
@@ -327,6 +327,8 @@ REACH_DISCARD(tile, discard_mode)
 ```
 
 双立直不单独占新模板；在具体动作阶段由当前局面补全 `REACH_STATE_DOUBLE`。
+
+`REACH_DISCARD` 是模型侧的复合模板。MJAI 中立直宣言和弃牌是两个服务端确认事件：bot 先回复 `reach`，后续弃牌由环境按照 MJAI 的决策窗口继续处理。因此实现时可以把 `REACH_DISCARD(tile, discard_mode)` 视为环境宏动作：环境先提交立直意图，再在合法弃牌窗口提交对应 `dahai`。该复合模板本身不直接生成输入协议事件 token。
 
 ### 9.4 `CHI`
 
@@ -482,10 +484,12 @@ RYUKYOKU
 
 上下文补全规则：
 
-| 情况 | `TYPE` | `VALUE` |
+| 情况 | 环境命令 | 元数据 |
 |---|---|---|
-| 九种九牌等主动途中流局 | `EVENT_ABORTIVE_RYUKYOKU` | 当前流局类型对应的 `ABORTIVE_TYPE_*` |
+| 九种九牌等主动途中流局 | 主动流局命令 / MJAI `ryukyoku` | 当前流局类型对应的 `abortive_type` |
 | 其他主动声明流局（若后续扩展） | 由具体规则决定 | 由具体规则决定 |
+
+`RYUKYOKU` 只表示玩家可以主动选择的途中流局，例如九种九牌。四风连打、四杠散了、四家立直等由服务器或环境规则自动结算的流局，不属于玩家主动动作，不需要额外占用动作模板。
 
 ### 9.11 `NUKIDORA`
 
@@ -509,6 +513,8 @@ NUKIDORA
 | `target` | `NONE` |
 | `value` | `VALUE_NONE` |
 
+`NUKIDORA` 只在支持三麻拔北的环境中启用。若当前规则或 MJAI 适配层不暴露拔北动作，则该模板应被 action mask 屏蔽。
+
 ## 10. 从 action_id 到具体动作
 
 推荐的解码流程：
@@ -519,7 +525,7 @@ NUKIDORA
 3. 在该类别内部按固定顺序恢复模板参数
 4. 读取当前决策窗口，补全 tile / target / turn / value / flag
 5. 生成 ActionInstance
-6. 将 ActionInstance 转换成一个事件 KyokuToken
+6. 将 ActionInstance 转换成环境侧执行命令或 MJAI response
 7. 若 action_id 落在 382..449，则当前版本不解码，直接视为 RESERVED_ACTION
 ```
 
@@ -530,10 +536,10 @@ action_id = 0
 -> PASS
 -> 当前窗口：下家打出 3p，可碰可跳过
 -> PASS(tile=3p, target=SHIMOCHA, turn=6)
--> (EVENT_PASS, SELF, 3p, SHIMOCHA, VALUE_NONE, NONE, TURN_6)
+-> MJAI none / 环境侧 pass command
 ```
 
-## 11. 从具体动作到单个事件 KyokuToken
+## 11. 从具体动作到环境命令
 
 当前 V1 的核心约束是：
 
@@ -541,33 +547,33 @@ action_id = 0
 一次模型输出
 = 一个 action_id
 = 一个 ActionInstance
-= 一个事件 KyokuToken
+= 一个环境侧执行命令或 MJAI response
 ```
 
-环境模块在收到这个事件后，再根据 `ActionInstance` 中的上下文信息和内部规则更新局面。
+环境模块在收到这个动作后，再根据 `ActionInstance` 中的上下文信息、当前 MJAI 决策窗口和内部规则执行动作。动作被服务器确认后，后续真实事件才会进入 `KyokuEventTuple V2` 输入序列。
 
-### 11.1 动作到事件 token 的映射
+### 11.1 动作到环境命令的映射
 
-| 动作 | 事件 KyokuToken |
+| 动作 | 环境命令 / MJAI response |
 |---|---|
-| `PASS` | `(EVENT_PASS, SELF, tile_or_NONE, target_or_NONE, VALUE_NONE, NONE, TURN_x)` |
-| `DISCARD(3p, TEDASHI)` | `(EVENT_DISCARD, SELF, 3p, NONE, VALUE_NONE, TEDASHI, TURN_x)` |
-| `DISCARD(3p, TSUMOGIRI)` | `(EVENT_DISCARD, SELF, 3p, NONE, VALUE_NONE, TSUMOGIRI, TURN_x)` |
-| `REACH_DISCARD(3p, TEDASHI)` | `(EVENT_DISCARD, SELF, 3p, NONE, VALUE_NONE, REACH, TURN_x)` |
-| `REACH_DISCARD(5pr, TSUMOGIRI)` | `(EVENT_DISCARD, SELF, 5pr, NONE, VALUE_NONE, REACH or DOUBLE_REACH, TURN_x)` |
-| `CHI` | `(EVENT_CHI, SELF, called_tile, KAMICHA, chi_shape, NONE, TURN_x)` |
-| `PON` | `(EVENT_PON, SELF, called_tile, target, VALUE_NONE, NONE, TURN_x)` |
-| `DAIMINKAN` | `(EVENT_DAIMINKAN, SELF, called_tile, target, VALUE_NONE, NONE, TURN_x)` |
-| `ANKAN` | `(EVENT_ANKAN, SELF, kan_tile, NONE, VALUE_NONE, NONE, TURN_x)` |
-| `KAKAN` | `(EVENT_KAKAN, SELF, add_tile, NONE, VALUE_NONE, NONE, TURN_x)` |
-| `WIN_RON` | `(EVENT_WIN, SELF, win_tile, target, WIN_TYPE_RON, NONE, TURN_x)` |
-| `WIN_TSUMO` | `(EVENT_WIN, SELF, NONE, SELF, WIN_TYPE_TSUMO, NONE, TURN_x)` |
-| `RYUKYOKU` | `(EVENT_ABORTIVE_RYUKYOKU, SELF, NONE, NONE, abortive_type, NONE, TURN_x)` |
-| `NUKIDORA` | `(EVENT_NUKIDORA, SELF, N, NONE, VALUE_NONE, NONE, TURN_x)` |
+| `PASS` | MJAI `none`，或环境侧 pass command |
+| `DISCARD(3p, TEDASHI)` | MJAI `dahai`，`pai=3p`，`tsumogiri=false` |
+| `DISCARD(3p, TSUMOGIRI)` | MJAI `dahai`，`pai=3p`，`tsumogiri=true` |
+| `REACH_DISCARD(3p, TEDASHI)` | 环境宏动作：先 MJAI `reach`，再在弃牌窗口提交 `dahai(pai=3p, tsumogiri=false)` |
+| `REACH_DISCARD(5pr, TSUMOGIRI)` | 环境宏动作：先 MJAI `reach`，再在弃牌窗口提交 `dahai(pai=5pr, tsumogiri=true)` |
+| `CHI` | MJAI `chi`，`consumed` 和 `target=KAMICHA` 由环境补全 |
+| `PON` | MJAI `pon`，`consumed` 和来源玩家由环境补全 |
+| `DAIMINKAN` | MJAI `daiminkan`，被杠牌和来源玩家由环境补全 |
+| `ANKAN` | MJAI `ankan`，暗杠牌由模板和当前手牌补全 |
+| `KAKAN` | MJAI `kakan`，加杠牌由模板和当前副露补全 |
+| `WIN_RON` | MJAI `hora`，和牌类型为荣和，和牌牌和来源玩家由当前窗口补全 |
+| `WIN_TSUMO` | MJAI `hora`，和牌类型为自摸 |
+| `RYUKYOKU` | MJAI `ryukyoku` 或环境侧主动流局命令，流局类型由当前机会补全 |
+| `NUKIDORA` | 环境侧拔北命令；若适配层支持 MJAI `nukidora`，则转为对应 response |
 
 ### 11.2 环境模块负责的内容
 
-动作解码成事件 token 之后，以下内容不再由模型输出协议继续展开，而是由环境模块负责：
+动作解码成环境命令之后，以下内容不再由模型输出协议继续展开，而是由环境模块负责：
 
 | 事项 | 责任方 |
 |---|---|
@@ -590,8 +596,8 @@ action_id = 0
 ```text
 ActionTemplate: PASS
 ActionInstance: PASS(tile=3p, target=SHIMOCHA, turn=6)
-KyokuToken:
-(EVENT_PASS, SELF, 3p, SHIMOCHA, VALUE_NONE, NONE, TURN_6)
+EnvironmentCommand:
+MJAI none / pass command
 ```
 
 ### 12.2 普通手切
@@ -599,8 +605,8 @@ KyokuToken:
 ```text
 ActionTemplate: DISCARD(3p, TEDASHI)
 ActionInstance: DISCARD(tile=3p, flag=TEDASHI, turn=6)
-KyokuToken:
-(EVENT_DISCARD, SELF, 3p, NONE, VALUE_NONE, TEDASHI, TURN_6)
+EnvironmentCommand:
+MJAI dahai(pai=3p, tsumogiri=false)
 ```
 
 ### 12.3 立直并摸切
@@ -608,8 +614,8 @@ KyokuToken:
 ```text
 ActionTemplate: REACH_DISCARD(6p, TSUMOGIRI)
 ActionInstance: REACH_DISCARD(tile=6p, reach_type=NORMAL, flag=REACH, turn=8)
-KyokuToken:
-(EVENT_DISCARD, SELF, 6p, NONE, VALUE_NONE, REACH, TURN_8)
+EnvironmentCommand:
+MJAI reach -> MJAI dahai(pai=6p, tsumogiri=true)
 ```
 
 ### 12.4 碰赤五组合
@@ -619,8 +625,8 @@ KyokuToken:
 ```text
 ActionTemplate: PON(consumed=[5p,5pr])
 ActionInstance: PON(tile=5p, target=KAMICHA, consumed=[5pr,5p], turn=9)
-KyokuToken:
-(EVENT_PON, SELF, 5p, KAMICHA, VALUE_NONE, NONE, TURN_9)
+EnvironmentCommand:
+MJAI pon(pai=5p, consumed=[5pr,5p], target=KAMICHA)
 ```
 
 环境解释：
@@ -637,8 +643,8 @@ KyokuToken:
 ```text
 ActionTemplate: RYUKYOKU
 ActionInstance: RYUKYOKU(type=ABORTIVE_TYPE_1, turn=1)
-KyokuToken:
-(EVENT_ABORTIVE_RYUKYOKU, SELF, NONE, NONE, ABORTIVE_TYPE_1, NONE, TURN_1)
+EnvironmentCommand:
+MJAI ryukyoku / active abortive draw command
 ```
 
 ## 13. 与模型输出的关系
@@ -664,8 +670,8 @@ logits
 -> action_id
 -> 若 action_id in [0, 381]，则解码为 ActionTemplate
 -> ActionInstance（结合当前局面补全）
--> 单个事件 KyokuToken
--> 环境根据该事件执行状态转移
+-> 环境侧执行命令 / MJAI response
+-> 环境等待服务器确认后的真实事件进入输入历史
 -> 若 action_id in [382, 449]，则命中 RESERVED_ACTION，当前版本不做协议内解码
 ```
 
@@ -699,10 +705,10 @@ logits
 
 | 输出范围 | 作用 |
 |---|---|
-| `0..381` | 当前正式定义、可解码、可映射回 `KyokuTokenProtocol` 的动作 |
+| `0..381` | 当前正式定义、可解码为环境命令的动作 |
 | `382..449` | 预留位，当前不解析 |
 
-也就是说，当前版本不是“定义 450 个动作”，而是“定义 382 个动作，并给模型保留到 450 维输出容量”。在解码时，仍然只对前 `382` 个离散 id 进行动作补全，并把每个动作映射成一个事件 `KyokuToken`；这个事件对局面的影响由环境模块负责执行。
+也就是说，当前版本不是“定义 450 个动作”，而是“定义 382 个动作，并给模型保留到 450 维输出容量”。在解码时，仍然只对前 `382` 个离散 id 进行动作补全，并把每个动作映射成环境侧执行命令或 MJAI response；动作对局面的影响由环境模块和服务器确认后的真实事件共同决定。
 
 这样我们同时满足了三件事：
 
@@ -710,4 +716,4 @@ logits
 |---|---|
 | 动作空间稳定 | 是 |
 | 能覆盖普通三麻/四麻基础动作 | 是 |
-| 每个动作都能回到 `KyokuTokenProtocol` | 是 |
+| 每个动作都能转换为环境命令 | 是 |
